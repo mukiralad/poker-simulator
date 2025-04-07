@@ -174,22 +174,29 @@ export function PokerTable({ difficulty, opponents, bigBlind, startingChips, onG
     updatedPlayers[bbIndex].chips -= bigBlind
     updatedPlayers[bbIndex].betAmount = bigBlind
 
+    // Update all state at once to ensure consistency
+    const firstToAct = (bbIndex + 1) % updatedPlayers.length
+    
     setPlayers(updatedPlayers)
     setCurrentBet(bigBlind)
     setPot(smallBlind + bigBlind)
-
-    // Start with the player to the left of the big blind
-    setCurrentPlayerIndex(3 % updatedPlayers.length)
+    setLastRaiseIndex(bbIndex)
+    setCurrentPlayerIndex(firstToAct)
     setMessage(
       `${updatedPlayers[sbIndex].name} posts small blind (${smallBlind}), ${updatedPlayers[bbIndex].name} posts big blind (${bigBlind})`,
     )
 
-    // If it's the human player's turn, wait for input
-    // Otherwise, let the AI play after a short delay
-    if (currentPlayerIndex !== humanPlayerIndex) {
-      setTimeout(() => {
-        aiAction()
+    // If it's not the human player's turn, schedule the AI action
+    if (firstToAct !== humanPlayerIndex) {
+      const aiActionTimeout = setTimeout(() => {
+        const currentState = updatedPlayers[firstToAct]
+        if (currentState && !currentState.folded && !currentState.isAllIn) {
+          aiAction()
+        }
       }, 1000)
+
+      // Clean up timeout if component unmounts
+      return () => clearTimeout(aiActionTimeout)
     }
   }
 
@@ -369,7 +376,6 @@ export function PokerTable({ difficulty, opponents, bigBlind, startingChips, onG
     // Check if the hand is over (only one player left)
     const activePlayers = players.filter((p) => !p.folded && p.isActive)
     if (activePlayers.length === 1) {
-      // Hand is over, award pot to the remaining player
       endHand(activePlayers[0].id)
       return
     }
@@ -381,12 +387,13 @@ export function PokerTable({ difficulty, opponents, bigBlind, startingChips, onG
 
     // If all players are all-in or have matched the current bet
     const bettingComplete =
-      activeBettingPlayers.every((p) => p.betAmount === currentBet) &&
-      (lastRaiseIndex === -1 || hasCompletedRound(lastRaiseIndex))
+      activeBettingPlayers.length === 0 ||
+      (activeBettingPlayers.every((p) => p.betAmount === currentBet) &&
+       hasCompletedRound(lastRaiseIndex))
 
-    if (bettingComplete || activeBettingPlayers.length === 0) {
-      // If we're at showdown, evaluate hands
-      if (gameStage === "river") {
+    if (bettingComplete) {
+      // If we're at showdown or all but one player is all-in, go to showdown
+      if (gameStage === "river" || (nonFoldedPlayers.length > 1 && activeBettingPlayers.length <= 1)) {
         setGameStage("showdown")
         showdown()
         return
@@ -397,198 +404,159 @@ export function PokerTable({ difficulty, opponents, bigBlind, startingChips, onG
       return
     }
 
-    // Find the next active player
+    // Find the next active player who can still bet
     let nextPlayerIndex = (currentPlayerIndex + 1) % players.length
-    while (players[nextPlayerIndex].folded || players[nextPlayerIndex].isAllIn || !players[nextPlayerIndex].isActive) {
-      nextPlayerIndex = (nextPlayerIndex + 1) % players.length
+    let loopCount = 0
 
-      // If we've gone all the way around, break to avoid infinite loop
-      if (nextPlayerIndex === currentPlayerIndex) {
+    // Keep track of the starting point to avoid infinite loop
+    const startingIndex = nextPlayerIndex
+
+    while (true) {
+      const player = players[nextPlayerIndex]
+      if (!player.folded && !player.isAllIn && player.isActive) {
         break
+      }
+      nextPlayerIndex = (nextPlayerIndex + 1) % players.length
+      loopCount++
+
+      // If we've gone through all players or back to where we started, move to next stage
+      if (loopCount >= players.length || nextPlayerIndex === startingIndex) {
+        if (gameStage === "river") {
+          setGameStage("showdown")
+          showdown()
+        } else {
+          dealCommunityCards()
+        }
+        return
       }
     }
 
     setCurrentPlayerIndex(nextPlayerIndex)
 
-    // If it's the human player's turn, wait for input
-    // Otherwise, let the AI play after a short delay
+    // If it's not the human player's turn, schedule the AI action
     if (nextPlayerIndex !== humanPlayerIndex) {
-      setTimeout(() => {
-        aiAction()
+      const aiActionTimeout = setTimeout(() => {
+        const currentState = players[nextPlayerIndex]
+        if (currentState && !currentState.folded && !currentState.isAllIn && currentState.isActive) {
+          aiAction()
+        }
       }, 1000)
+
+      // Clean up timeout if component unmounts
+      return () => clearTimeout(aiActionTimeout)
     }
   }
 
   // Check if we've completed a full betting round since the last raise
   const hasCompletedRound = (lastRaiseIdx: number) => {
-    const currentIdx = currentPlayerIndex
+    // If there's no last raise, the round is complete
+    if (lastRaiseIdx === -1) return true
 
-    // If we're back at the last raiser, we've completed the round
-    return currentIdx === lastRaiseIdx
+    // Start from the player after the last raise
+    let idx = (lastRaiseIdx + 1) % players.length
+    let seenActivePlayer = false
+
+    // Go through one complete round
+    while (idx !== lastRaiseIdx) {
+      const player = players[idx]
+      // Only consider active players who haven't folded or gone all-in
+      if (!player.folded && !player.isAllIn && player.isActive) {
+        // If any player hasn't matched the current bet, round isn't complete
+        if (player.betAmount < currentBet) {
+          return false
+        }
+        seenActivePlayer = true
+      }
+      idx = (idx + 1) % players.length
+    }
+
+    // Check the last raiser as well
+    const lastRaiser = players[lastRaiseIdx]
+    if (!lastRaiser.folded && !lastRaiser.isAllIn && lastRaiser.isActive) {
+      if (lastRaiser.betAmount < currentBet) {
+        return false
+      }
+      seenActivePlayer = true
+    }
+
+    // Round is complete if we've seen at least one active player
+    return seenActivePlayer
   }
 
   // AI player action
   const aiAction = () => {
-    if (gameResult) return
+    // Safety checks
+    if (gameResult || !players[currentPlayerIndex]) {
+      setIsThinking(false)
+      return
+    }
 
     setIsThinking(true)
 
-    // Simulate AI thinking
-    setTimeout(() => {
-      const player = players[currentPlayerIndex]
-      const aiLevel = difficulty
+    const aiActionTimeout = setTimeout(() => {
+      // Double check state is still valid
+      if (gameResult || !players[currentPlayerIndex] || 
+          players[currentPlayerIndex].folded || 
+          players[currentPlayerIndex].isAllIn) {
+        setIsThinking(false)
+        return
+      }
 
-      // Simple AI logic based on difficulty
-      let action: PlayerAction = "fold"
+      const player = players[currentPlayerIndex]
+      const handStrength = evaluateAIHandStrength(player, difficulty)
+      const callAmount = currentBet - player.betAmount
+      const potOdds = callAmount / (pot + callAmount)
+
+      let action: PlayerAction
       let betSize = 0
 
-      // Calculate pot odds and hand strength
-      const handStrength = evaluateAIHandStrength(player, aiLevel)
-      const potOdds = currentBet > 0 ? (currentBet - player.betAmount) / (pot + currentBet) : 0
-
-      if (aiLevel === "beginner") {
-        // Beginner AI - plays straightforward based on hand strength
-        if (handStrength > 0.7) {
-          // Strong hand - raise or bet
-          if (currentBet === 0) {
-            action = "bet"
-            betSize = Math.min(pot * 0.5, player.chips)
-            betSize = Math.max(bigBlind, Math.floor(betSize))
-          } else if (player.chips <= currentBet - player.betAmount) {
-            action = "allIn"
+      try {
+        // Determine action based on current situation
+        if (currentBet === 0 || player.betAmount === currentBet) {
+          // No bet to call
+          if (handStrength < 0.3) {
+            action = "check"
           } else {
-            action = Math.random() > 0.5 ? "call" : "raise"
-            if (action === "raise") {
-              betSize = Math.min(currentBet * 2, player.chips + player.betAmount)
+            // Bet with stronger hands
+            action = handStrength > 0.6 ? "bet" : "check"
+            if (action === "bet") {
+              betSize = Math.min(
+                Math.max(pot * 0.5, bigBlind),
+                player.chips
+              )
             }
           }
-        } else if (handStrength > 0.4) {
-          // Medium hand - call or check
-          if (currentBet === 0 || player.betAmount === currentBet) {
-            action = "check"
-          } else if (player.chips <= currentBet - player.betAmount) {
-            action = Math.random() > 0.7 ? "allIn" : "fold"
-          } else {
-            action = "call"
-          }
         } else {
-          // Weak hand - check or fold
-          if (currentBet === 0 || player.betAmount === currentBet) {
-            action = "check"
+          // There's a bet to call
+          if (callAmount >= player.chips) {
+            // All-in decision
+            action = handStrength > 0.6 ? "allIn" : "fold"
+          } else if (handStrength > 0.8) {
+            // Very strong hand - raise
+            action = "raise"
+            betSize = Math.min(
+              currentBet * 2,
+              player.chips + player.betAmount
+            )
+          } else if (handStrength > potOdds + 0.1) {
+            // Decent hand with good pot odds - call
+            action = "call"
           } else {
+            // Weak hand - fold
             action = "fold"
           }
         }
-      } else if (aiLevel === "intermediate") {
-        // Intermediate AI - considers pot odds and position
-        const isLatePosition = currentPlayerIndex > players.length / 2
-        const bluffFactor = Math.random() * 0.2
 
-        if (handStrength + bluffFactor > 0.7) {
-          // Strong hand - raise or bet
-          if (currentBet === 0) {
-            action = "bet"
-            betSize = Math.min(pot * 0.75, player.chips)
-            betSize = Math.max(bigBlind, Math.floor(betSize))
-          } else if (player.chips <= currentBet - player.betAmount) {
-            action = "allIn"
-          } else {
-            action = Math.random() > 0.3 ? "raise" : "call"
-            if (action === "raise") {
-              betSize = Math.min(currentBet * 2.5, player.chips + player.betAmount)
-            }
-          }
-        } else if (handStrength > potOdds || (handStrength > 0.3 && isLatePosition)) {
-          // Medium hand or late position - call or check
-          if (currentBet === 0 || player.betAmount === currentBet) {
-            action = "check"
-          } else if (player.chips <= currentBet - player.betAmount) {
-            action = Math.random() > 0.5 ? "allIn" : "fold"
-          } else {
-            action = "call"
-          }
-        } else {
-          // Weak hand - check, fold, or occasional bluff
-          if (currentBet === 0 || player.betAmount === currentBet) {
-            action = Math.random() > 0.8 && isLatePosition ? "bet" : "check"
-            if (action === "bet") {
-              betSize = Math.min(pot * 0.5, player.chips)
-              betSize = Math.max(bigBlind, Math.floor(betSize))
-            }
-          } else {
-            action = Math.random() > 0.9 && isLatePosition ? "raise" : "fold"
-            if (action === "raise") {
-              betSize = Math.min(currentBet * 2, player.chips + player.betAmount)
-            }
-          }
-        }
-      } else {
-        // Advanced AI - uses more complex strategy
-        const isLatePosition = currentPlayerIndex > players.length / 2
-        const bluffFactor = Math.random() * 0.3
-        const playerTendency = 0.5 // Neutral tendency (could track player behavior over time)
-
-        if (handStrength + (isLatePosition ? 0.1 : 0) > 0.75) {
-          // Strong hand - value bet or raise
-          if (currentBet === 0) {
-            action = "bet"
-            // Size bet based on board texture and game stage
-            const sizingFactor = gameStage === "river" ? 0.9 : 0.7
-            betSize = Math.min(pot * sizingFactor, player.chips)
-            betSize = Math.max(bigBlind, Math.floor(betSize))
-          } else if (player.chips <= currentBet - player.betAmount) {
-            action = "allIn"
-          } else {
-            action = Math.random() > 0.2 ? "raise" : "call"
-            if (action === "raise") {
-              betSize = Math.min(currentBet * 3, player.chips + player.betAmount)
-            }
-          }
-        } else if (handStrength > potOdds + 0.1 || (handStrength > 0.4 && isLatePosition)) {
-          // Medium hand - call, check, or small raise
-          if (currentBet === 0 || player.betAmount === currentBet) {
-            action = Math.random() > 0.6 ? "bet" : "check"
-            if (action === "bet") {
-              betSize = Math.min(pot * 0.5, player.chips)
-              betSize = Math.max(bigBlind, Math.floor(betSize))
-            }
-          } else if (player.chips <= currentBet - player.betAmount) {
-            // Consider pot odds for all-in decision
-            action = handStrength > potOdds + 0.2 ? "allIn" : "fold"
-          } else {
-            // Mix of calls and raises
-            action = Math.random() > 0.7 ? "raise" : "call"
-            if (action === "raise") {
-              betSize = Math.min(currentBet * 1.5, player.chips + player.betAmount)
-            }
-          }
-        } else {
-          // Weak hand - check, fold, or strategic bluff
-          if (currentBet === 0 || player.betAmount === currentBet) {
-            // Check most of the time, occasionally bluff
-            action = Math.random() > 0.8 ? "bet" : "check"
-            if (action === "bet") {
-              betSize = Math.min(pot * 0.6, player.chips)
-              betSize = Math.max(bigBlind, Math.floor(betSize))
-            }
-          } else {
-            // Consider bluffing based on position and player tendencies
-            const bluffThreshold = isLatePosition ? 0.85 : 0.95
-            action = Math.random() > bluffThreshold ? "raise" : "fold"
-            if (action === "raise") {
-              betSize = Math.min(currentBet * 2.5, player.chips + player.betAmount)
-            }
-          }
-        }
+        setIsThinking(false)
+        handleAction(action, Math.floor(betSize))
+      } catch (error) {
+        // If something goes wrong, just check or fold
+        setIsThinking(false)
+        handleAction(currentBet === 0 ? "check" : "fold")
       }
+    }, 1000)
 
-      // Round bet size to nearest chip
-      betSize = Math.floor(betSize)
-
-      // Execute the chosen action
-      setIsThinking(false)
-      handleAction(action, betSize)
-    }, 1500)
+    return () => clearTimeout(aiActionTimeout)
   }
 
   // Evaluate AI hand strength (simplified)
@@ -943,7 +911,13 @@ export function PokerTable({ difficulty, opponents, bigBlind, startingChips, onG
         </div>
 
         {/* Opponents */}
-        <div className="grid grid-cols-5 gap-4 mb-16">
+        <div className={cn(
+          "grid gap-4 mb-16",
+          opponents === 2 && "grid-cols-2",
+          opponents === 3 && "grid-cols-3",
+          opponents === 4 && "grid-cols-4",
+          opponents === 5 && "grid-cols-5"
+        )}>
           {players.slice(1).map((player, i) => (
             <div
               key={`opponent-${i}`}
